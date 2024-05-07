@@ -1,0 +1,808 @@
+---
+title: "Analysis"
+output:
+  word_document: default
+  pdf_document: default
+date: "2024-04-15"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(rvest)
+library(scraEP)
+library(arm)
+library(patchwork)
+library(pROC)
+library(caret)
+library(ROCR)
+library(tinytex)
+
+options(scipen = 999)
+```
+
+# Datascraping
+
+## The Plan
+
+The data collection forms the backbone of any statistical analysis and as such it was crucial for any model I made to be build around a large, sound database with numerous variables to investigate relationships between. My approach was as follows: it appeared difficult to find a single database containing all relevant data I needed - the players transferred and statistics related to their first Premier League season - so I instead elected to collect data from different sources for each area. Data on transfers, player performance and team performance were collected separately and later joined on matching variables such as a players name, a clubs name or a season. The advantage of this was ultimately that I could add as many or as few variables as I needed, so long as there was a way to connect them with the overall dataframe, but on the other hand there were drawbacks such as a need to ensure that all data was formatted identically, including but not limited to accents on a players name, whether a club was abbreviated and/or hyphenated etc.
+
+## Transfers
+
+### Data Collection
+
+For the data collection section, I chose to begin with finding transfer data of players in the recent era of the Premier League. I chose to begin here to ensure that there would be enough data to build a model which is firstly accurate and secondly useful; a large number of football transfers is useful for the analysis conducted later in the report but it also demonstrates the usefulness of an accurate model. I used data from https://www.transfermarkt.com/ since this was the first website I checked which had all data I needed including which window a transfer was made in. 
+
+I firstly initialised a dataframe to store all transfer data along with a vector storing transfer window titles as they appear in the web url, s or w. One url for transfermarket stores all the transfers from one window in one season so I then read in the transfer data by iterating through year i and window j, adjusting the url I am scraping accordingly, before further iterating through each of the k clubs, adding them to the overall df. Finally I tidy up by removing unnecessary variables (producing nas) and correcting variable names.
+
+```{r,echo=FALSE}
+window = c("s","w")
+final_df = data.frame(matrix(nrow = 0, ncol = 7))
+names(final_df) = c("In","Age","Position","Market_Value","Left","Fee","Year")
+```
+
+```{r,echo=FALSE}
+for (i in 1:16) {
+  for (j in 1:2){
+    df = paste0("https://www.transfermarkt.com/premier-league/transfers/wettbewerb/GB1/plus/?saison_id=",2006+i,"&s_w=",window[j],"&leihe=0&intern=0&intern=1") %>%
+      read_html() %>%
+      html_nodes("table") %>%
+      html_table(fill = T) %>%
+      lapply(.,function(x) setNames(x,c("In","Age","Nat","Position","Market Value","Left","Fee"))) #load the ith year of tranfers
+  
+    df = df[-1] #remove the first tibble (doesnt feature transfers)
+  
+    year_df_i = as.data.frame(df[1]) %>% #
+      mutate(Year = 2006+i) %>%
+      mutate(Window = window[j])
+    names(year_df_i) = c("In","Age","Position","Market_Value","Left","Fee","Year","Window")  #rename columns to match up
+  
+    for (k in 1:19) { #iterating through each other teams transfers in
+      club_df = as.data.frame(df[2*k+1]) %>%
+        mutate(Year = 2006+i)%>%
+        mutate(Window = window[j])
+      names(club_df)=c("In", "Age", "Position", "Market_Value", "Left", "Fee","Year","Window")
+      year_df_i = rbind(year_df_i,club_df) #placing them at the end of the yearly df
+  }
+    final_df = rbind(final_df,year_df_i) #placing them at the end of the overall df
+  }
+}
+final_df = final_df[,-3]
+final_df = final_df[,-6]
+final_df = final_df[,-4]
+
+names(final_df) = c("Player","Age","Position","Market_Value","Left","Fee","Season","Window")
+```
+
+### Cleaning
+
+Upon viewing the first few entries of this dataframe (after removing the foreign Euro character using gsub())
+```{r,echo=FALSE}
+final_df$Fee = gsub("\\€|","",final_df$Fee)
+final_df$Market_Value = gsub("\\€|","",final_df$Market_Value)
+head(final_df)
+```
+A few areas necessary of cleaning became apparent: for the 'In' variable, player names were formatted incorrectly, in some instances a player name would simply be repeated, in others a player would have his name repeated but his first name reduced to the first letter and then a '.'. Secondly, in the 'Fee' and 'Market_Value' variables, the entries are not numeric as they contain strings of characters and 0s are formatted as '-'. To approach the first problem I once again iterated through the data frame, this time checking for the presence of '.': if one is found in the current entry, then it is removed along with every character after it and the first character before. If one isnt found then the second half of the string is removed.
+
+```{r,echo=FALSE}
+for(k in 1:length(final_df$Player)) {
+  if (grepl(".",final_df$Player[k],fixed = T)==TRUE){  #if the player goes by 2 names (eg Brad Cooper)
+    final_df$Player[k] = gsub("\\..*","",final_df$Player[k]) #remove everything after the '.'
+    final_df$Player[k] = substr(final_df$Player[k],1,nchar(final_df$Player[k])-1) #and the character before '.'
+  } else {  #if the player goes by 1 name (eg Fred)
+    final_df$Player[k] = substr(final_df$Player[k],1,nchar(final_df$Player[k])/2) #remove half of the string
+  }
+}
+final_df$Player = unaccent(final_df$Player)
+head(final_df)
+```
+
+To deal with the issue of the monetary variables I had to solve two issues. One of these was that players under a valuation/fee if 1 million euro would instead be represented in terms of hundreds of thousand of euro, that is, a player valued at 0.8 million would be represented as 800k. Secondly players valuations and fee were not stored as numeric variables. Before approach the variables themselves, I created two vectors for the detection of the character 'k' within each entry of each variable. Then I used the gsub function to remove the non-numeric characters and set NAs to 0. Finally I divided the fee and market values by 1000 to the power of the boolean vectors for detection I had created. This way, all entries which originally contained a k would be divided by 1000 and all others would remain as they were.
+
+```{r,echo=FALSE, warning=FALSE}
+booltabmv = str_detect(final_df$Market_Value,"k")
+booltabf = str_detect(final_df$Fee,"k")
+final_df$Market_Value = gsub("\\m|","",final_df$Market_Value)
+final_df$Fee = gsub("\\m|","",final_df$Fee)
+final_df$Market_Value = gsub("\\k|","",final_df$Market_Value)
+final_df$Fee = gsub("\\k|","",final_df$Fee)
+final_df$Fee = as.numeric(final_df$Fee)
+final_df$Market_Value = as.numeric(final_df$Market_Value)
+final_df$Fee[is.na(final_df$Fee)] = 0
+final_df$Market_Value[is.na(final_df$Market_Value)] = 0
+final_df$Market_Value = final_df$Market_Value/1000^booltabmv
+final_df$Fee = final_df$Fee/1000^booltabf
+```
+
+Upon further inspection. I also noticed that from the website, if a club made no transfers in a given window of a given season, the website would instead enter 'No new arrivals' into the database. 
+
+```{r,echo = FALSE}
+final_df %>%
+  filter(Age == "No new arrivals") %>%
+  head()
+```
+
+Since these had been read into my dataframe I also had to remove those, which I did by subsetting the full dataframe and the full dataframe where the player age was listed as 'No new arrival'
+
+
+```{r,echo=FALSE}
+final_df = subset(final_df, final_df$Age != "No new arrivals")
+final_df %>%
+  filter(Age == "No new arrivals")
+```
+
+With no other clear need of cleaning at this time I wrote the dataframe to a CSV file.
+
+```{r,echo=FALSE}
+write.csv(final_df, "D:\\transfersall.csv",row.names = FALSE)
+```
+
+
+
+
+## Player Performance Statistics
+
+### Selecting Clubs and Seasons
+
+Moving to player performance data, I chose to use data presented on https://www.worldfootball.net/. The reasoning behind this was simple: there was just more data available than that of other websites I had found previously. There were very precise statistics such as number of minutes played, number of appearances, number of games the player was substituted on/off, goal contributions and discipline. I first need a reference of clubs in the premier league in a given year. For the sake of the analysis, I decided to consider the teams who were placed in the premier league for two consecutive seasons - this way I can use the season before a players transfer as a reference for comparison with the season of a players transfer. To represent this data I wrote an excel spreadsheet for the different seasons with 1 indicating a team was in the league and 0 indicating not. The purpose of this is so that I only scrape the data from clubs and seasons that were in the league in the years I require. An alternative approach to this would've been to scrape all Premier League tables from the necessary years and check for name matches. In hindsight I should've opted for this approach from the beginning to make the process more analogous and less involved in general. I then initialised a dataframe 'toread' to store the set of pairs of clubs with seasons that a given team was in the premier league. I iterated through the teams and seasons to check all of the seasons the current index of teams was in. Note that since I only took teams in the league for two seasons running, and since I add both of said seasons simultaneously, if a team was in the league for three seasons then the second of these would be duplicated in the data frame. So I corrected for this after iterating by removing duplicated values.
+
+```{r,echo=FALSE}
+presence = read_excel("D:\\LeaguePresence.xlsx")[,-1] #read in binary table of if team was in league in given year
+clubs = names(presence) #the list of clubs that have been in the prem
+
+toread = data.frame(matrix(ncol = 2, nrow = 0)) #initialising df for which teams to scrape
+names(toread) = c("Club","SeasonStart")
+```
+
+```{r,echo=FALSE}
+for (teams in 1:length(clubs)){  #iterating through teams
+  for (seasonst in 1:15){ #iterating through seasons
+    if (presence[seasonst,teams] == 1 & presence[seasonst+1,teams] == 1) {  #if they were in 2 seasons running
+      check = as.data.frame(matrix(nrow = 0,ncol = 2))
+      names(check) = c("Club","SeasonStart")
+      check[1,] = c(clubs[teams],paste0(2006+seasonst,"-",2007+seasonst))
+      check[2,] = c(clubs[teams],paste0(2007+seasonst,"-",2008+seasonst))
+      toread = rbind(check,toread)  #add them and the season to the df
+    }
+  }
+}
+toread = toread[!duplicated(toread),]
+head(toread)
+```
+
+### Data Collection
+
+I followed a very similar structure to that of the transfer data: iterating through the toread data frame, adjusting the url to fit the current index and writing that to an individual dataframe before using rbind to add this to the end of the overall dataframe.
+
+```{r,echo=FALSE}
+total = as.data.frame(matrix(nrow = 0, ncol = 12))  #initialising df for playerbase
+for (i in 1:length(toread$Club)) {  #iterating through the list of club-seasons
+  starter = paste0("https://www.worldfootball.net/team_performance/",toread[i,1],"/eng-premier-league-",toread[i,2],"/") %>%
+    read_html() %>%
+    html_nodes("table") %>%
+    html_table(fill = T) %>%
+    lapply(.,function(x) setNames(x,c("Player", "Minutes", "Apps","Starts","Subbed_On",
+                                      "Subbed off","Goals","Yellows","Second_Yellows","Reds")))
+  #scraping the table for the team in the season
+  df = as.data.frame(starter[2])[-1,]%>%
+    mutate(Club = toread[i,1])%>%
+    mutate(Season = toread[i,2])  #adding the club and season they were in
+  total = rbind(total,df) #adding these players to the overall df
+}
+```
+
+### Cleaning
+
+Upon viewing the first few entries of this dataframe
+
+```{r,echo=FALSE}
+head(total)
+```
+
+I noticed some areas that could be made easier to use in the future: from the transfers dataframe, I knew that player names there were stored without accents and so should be altered to match here. In addition, all variables other than the players/clubs names could be altered to be numeric variables for analysis. To achieve these I applied the as.double function to all necessary variables, setting any occurring NAs to 0, as well as removing the ' from the minutes variable using gsub. Finally I used the unaccent function to adjust player names to match.
+
+
+```{r,echo=FALSE,warning=FALSE}
+total$Minutes = gsub("\\'|","",total$Minutes)
+total$Minutes[is.na(as.double(total$Minutes))]=0
+total$Reds[is.na(as.double(total$Reds))]=0
+total$Starts[is.na(as.double(total$Starts))]=0
+total$Subbed_On[is.na(as.double(total$Subbed_On))]=0
+total$Subbed.off[is.na(as.double(total$Subbed.off))]=0
+total$Goals[is.na(as.double(total$Goals))]=0
+total$Yellows[is.na(as.double(total$Yellows))]=0
+total$Second_Yellows[is.na(as.double(total$Second_Yellows))]=0
+total$Apps[is.na(as.double(total$Apps))]=0
+total$Season = as.double(gsub("\\-.*","",total$Season))
+total$Player = unaccent(total$Player)
+total = total %>%
+  mutate_at(c('Minutes','Apps','Starts','Subbed_On','Subbed.off','Goals','Yellows','Second_Yellows','Reds'),as.numeric)
+head(total)
+```
+
+Now that the dataframe appears to be easier to manage, we write to a separate CSV document.
+
+```{r,echo=FALSE}
+write.csv(total, "D:\\appearance_stats.csv",row.names = FALSE)
+```
+
+## Team League Performance
+
+### Data Collection
+
+The final instance of webscraping is for the season league tables, following near identical structure to previous instances: we first create a list of the premier league teams we are looking for (these are the same ones as are in the prescence spreadsheet, just named differently), before iterating through each year on the https://www.skysports.com/ website.
+
+```{r,echo=FALSE}
+tot = as.data.frame(matrix(nrow = 0, ncol = 11))
+names(tot) = c("Pos","Club","Pl","W","D","L","F","A","GD","Pts","Season")
+clubs.new = c("Arsenal","Aston Villa","Birmingham","Blackburn",
+              "Blackpool","Bolton","Bournemouth","Brentford",
+              "Brighton","Burnley","Cardiff","Chelsea",
+              "Crystal Palace","Everton","Fulham","Huddersfield",
+              "Hull City","Leeds","Leicester","Liverpool",
+              "Man City","Man Utd","Middlesbrough","Newcastle",
+              "Norwich","Nottm Forest","Portsmouth","QPR",
+              "Reading","Sheff Utd","Southampton","Stoke City",
+              "Sunderland","Swansea","Tottenham","Watford",
+              "West Brom","West Ham","Wigan","Wolves")
+for(i in 1:16){
+  starter = paste0("https://www.skysports.com/premier-league-table/",2006+i,"") %>%
+    read_html() %>%
+    html_nodes("table") %>%
+    html_table(fill = T) %>%
+    lapply(.,function(x) setNames(x,c("Pos","Club","Pl","W","D","L","F","A","GD","Pts")))
+  yeardf = as.data.frame(starter[1])
+  yeardf = yeardf[,-11] %>%
+    mutate(Season = 2006+i)
+  tot = rbind(tot,yeardf)
+}
+```
+
+### Cleaning
+
+Upon inspection of the head of the data
+
+```{r,echo=FALSE}
+head(tot)
+```
+
+We notice a naming discrepency: in the first season checked, all teams are followed by a number of asterisks, which we remove, along with the ' ' preceding it. It is worth noting that there is two occasions this occurs on the dataframe; in the first season I scraped, which appears to be an error on the end of skysports and in the Portsmouth 2009 season, which was inputted to indicate the club were entering administration at the time. I also renamed the clubs to match the other files, which will be useful for matching data in analysis.
+
+```{r,echo=FALSE}
+for(i in 1:length(tot$Club)){
+  if (str_detect(tot$Club,"\\*")[i] == TRUE){
+    tot$Club[i] = gsub("\\*.*","",tot$Club[i])
+    tot$Club[i] = substr(tot$Club[i],1,nchar(tot$Club[i])-1)}
+}
+```
+
+```{r,echo=FALSE}
+renaming = tot %>%
+  group_by(Club) %>%
+  summarise(n=n()) %>%
+  arrange(Club)
+oldnames = renaming$Club
+oldnames = setdiff(oldnames,c("Derby County"))
+
+for(i in 1:length(tot$Club)){
+  for(j in 1:length(clubs.new)){
+    if(tot$Club[i] == oldnames[j]){
+      tot$Club[i] = clubs.new[j]
+    }
+  }
+}
+```
+
+```{r,echo = FALSE}
+head(tot)
+```
+
+After checking the data was stored as I required I once again saved the dataframe to another CSV file.
+
+```{r,echo=FALSE}
+write.csv(tot, "D:\\league_tables.csv",row.names = FALSE)
+```
+
+# Analysis
+
+## Building the Full Dataframe
+
+```{r,echo=FALSE}
+transfers = read.csv("D:\\transfersall.csv")
+playerstats = read.csv("D:\\appearance_stats.csv")
+teamstats = read.csv("D:\\league_tables.csv")
+```
+
+```{r,echo=FALSE}
+test = inner_join(transfers, playerstats, by = c("Player","Season"), relationship = "many-to-many")
+```
+
+I used a many-to-many relationship since it was possible for the same player to transfer twice in one season, either once in the Summer then once in the Winter or by returning from a loan and being reloaned out in the same season.
+
+One issue that appeared in the dataframe is that for some players they appeared to be transferred to their own club according to the dataframe. More specifically, if a player changed clubs after making appearances for their previous club, both in the Premier League then they would appear to have first transferred to their own club, then to their new club, which is not correct. For example 
+
+```{r,echo=FALSE}
+test %>%
+  filter(Player == "Dimitar Berbatov") %>%
+  filter(Season == 2008)
+```
+
+To remove these values I did the following. First I renamed the football clubs so they'd match in the 'Club' and 'Left' variables
+
+```{r,echo = FALSE}
+presence = read_excel("D:\\LeaguePresence.xlsx")[,-1] #read in binary table of if team was in league in given year
+clubs = names(presence) #the list of clubs that have been in the prem
+
+for(i in 1:40){
+  test$Club[test$Club == clubs[i]] = clubs.new[i]
+}
+```
+
+Then I iterated through the dataframes to check if the 'Club' variable matched the 'Left' variable; if not then I add it to the overall data frame; if so then move to the next index. Note that this doesn't mean I remove academy graduates since these are names in the form '[Club] U18s'.
+
+```{r,echo=FALSE}
+fulldf = as.data.frame(matrix(nrow = 0, ncol = 18))
+names(fulldf) = names(test)
+for(i in 1:length(test$Player)){
+  if(test$Club[i] != test$Left[i]){
+    fulldf = rbind(fulldf, test[i,])
+  }
+}
+```
+
+Finally I can connect the player dataframe to the team results frame by joining based on "Club" and "Season".
+
+```{r,echo=FALSE}
+fulldf = inner_join(fulldf,teamstats, by = c("Club", "Season"),relationship = "many-to-many")
+```
+
+## Exploratory Analysis
+
+### Change in Points per Game
+
+One metric I thought worth investigating for the ascertainment of a successful transfer was team overall success. The most simplistic measurement of a teams improvement is their change in points or points per game. To obtain this variable I first created a dummy dataframe, foo, where I grouped data by team and season such that only one entry per team per season existed:
+
+```{r,echo=FALSE}
+fulldf = fulldf %>%
+  mutate(LastSeasonPts=0,LastSeasonGD=0)
+foo = fulldf %>%
+  group_by(Club,Season) %>%
+  summarise(Pts = mean(Pts),GD = mean(GD))
+head(foo)
+```
+
+Using foo, I then iterate through the original dataframe, checking for matching clubs with seasons one lower than the current index. That is, I check for teams who were in the Premier League the season prior to that of the current index - if one is found, then the points from that previous season are set as the variable 'LastSeasonPts' for the current season and likewise with the goal difference.
+
+```{r,echo=FALSE}
+for(entry in 1:length(fulldf$Player)){
+  if(length(fulldf[fulldf$Club == fulldf$Club[entry] & fulldf$Season == fulldf$Season[entry]-1,]!=0)){
+    fulldf$LastSeasonPts[entry] = foo$Pts[foo$Club == fulldf$Club[entry] & foo$Season == fulldf$Season[entry]-1]
+    fulldf$LastSeasonGD[entry] = foo$GD[foo$Club == fulldf$Club[entry] & foo$Season == fulldf$Season[entry]-1]
+  }
+}
+```
+
+Note that this metric cannot apply to the first season scraped, since there is no previous data to obtain points from, so I now remove the first season from the dataframe.
+
+```{r,echo=FALSE}
+fulldf = setdiff(fulldf, fulldf[fulldf$Season == "2007",])
+```
+
+Finally, I construct the metrics sought in the first place: I calculate the points per game (PPG) before and after the player transfer as points/number of games. I then calculate the difference between these two as well as the change in goal difference.
+
+```{r,echo=FALSE}
+fulldf = fulldf %>%
+  mutate(PPG.Before = LastSeasonPts/38, PPG.After = Pts/38) %>%
+  mutate(PPG.Diff = PPG.After - PPG.Before) %>%
+  mutate(GD.Change = GD - LastSeasonGD)
+```
+
+I then attempted to plot a histogram of the points per game difference. I hypothesized that these should appear normally distributed centred approximately about zero, since overall points (sum of points of all Premier League teams) would remain near constant aside from some variation ie a points deduction or unusually large number of draws. However the plot demonstrated an issue within the data frame.
+
+```{r,echo=FALSE}
+hist(fulldf$PPG.Diff,breaks = 20, prob = TRUE, main = "Distribution of PPG.Diff",xlab = "PPG.Diff")
+curve(dnorm(x,mean = mean(fulldf$PPG.Diff),sd = sd(fulldf$PPG.Diff)),add = TRUE)
+```
+
+Since some teams may have been promoted into the Premier League that year, their value for LastSeasonPts was 0 - meaning that their value for PPG.Diff was in fact just their PPG. This unfortunately is an unavoidable limitation of this metric in this situation, though would be solved if I had more time/access to data from lower leagues in English football. In this case, I elected to consider just the teams who had been in the league both on season i and season i-1 and so I removed these entries and replotted:
+
+```{r,echo=FALSE}
+notpromoted = fulldf %>%
+  filter(LastSeasonPts != 0)
+
+hist(notpromoted$PPG.Diff, breaks = 20, prob = T, xlab = "PPG Difference", main = "Distribution of PPG Diff")
+mean(notpromoted$PPG.Diff)
+sd(notpromoted$PPG.Diff)
+curve(dnorm(x,mean = mean(notpromoted$PPG.Diff),sd = sd(notpromoted$PPG.Diff)),add = TRUE)
+```
+And obtain a much more familiar fit.
+
+### Fee
+
+More on exploratory analysis of the full dataframe, it seemed reasonable to investigate the effect of fee on player success rate. The assumption would be that for two players who have identical 'impact' (in this instance defined by their teams PPG.Diff value), the cheaper of the two should be deemed more successful.
+
+The variable Fee indicated the cost a club actually payed for a player (not to be confused with Market_Value, which is what TransferMarket values them at), and follows (approximately) a gamma distribution as follows:
+
+```{r,echo=FALSE}
+hist(notpromoted$Fee, breaks = 20, prob = T, xlab = "Fee", main = "Distribution of Fee")
+alpha.est = (mean(notpromoted$Fee)^2)/var(notpromoted$Fee)
+beta.est = (mean(notpromoted$Fee))/var(notpromoted$Fee)
+curve(dgamma(x,alpha.est,beta.est), add = TRUE)
+```
+
+We can also see some variation is the costs of players based on the positions they play:
+
+```{r,echo=FALSE}
+ggplot(notpromoted, aes(y = log(Fee))) + geom_boxplot() + geom_hline(yintercept = log(mean(notpromoted$Fee)),col = "blue")+ facet_wrap(~Position)
+```
+
+The blue lines in the plots above are intercepts at the mean value of a player transfer (all taken on a log scale). The variation in player price is especially apparent in positions further back along the field such as goalkeeper and left/right-backs. This is significant to note as when fitting a model, it may be worth considering the interaction between fee and position of the player.
+
+```{r, include = FALSE}
+notpromoted$Minutes = as.integer(notpromoted$Minutes)
+notpromoted$Market_Value = as.double(notpromoted$Market_Value)
+notpromoted$Season = as.integer(notpromoted$Season)
+notpromoted$Apps = as.integer(notpromoted$Apps)
+```
+
+I also produced a number of graphics indicating the relationship between Fee and other continuous variables of interest:
+
+```{r,echo=FALSE}
+plot1 = ggplot(notpromoted, aes(x = Minutes, y = Fee)) + geom_smooth()
+plot2 = ggplot(notpromoted, aes(x = Apps, y = Fee)) + geom_smooth()
+plot3 = ggplot(notpromoted, aes(x = Season, y = Fee)) + geom_smooth()
+plot4 = ggplot(notpromoted, aes(x = Pts, y = Fee)) + geom_smooth()
+plot1+plot2+plot3+plot4
+```
+
+In the graphics for the relationship between fee and minutes, appearances and points we see the expected relationship of a higher fee generally resulting in a higher 'output', which is positive for when it comes to fitting the model. In addition note the positive correlation between fee and season, which indicates an increase in average spending throughout the league; it may be worth using an interaction term for these variables in models fit.
+
+### Club League Standing
+
+Another idea worth investigating is the difference a club pays for a player based on what position they lie in the standings. If we plot 'Fee' against 'Pos':
+
+```{r,echo=FALSE}
+ggplot(fulldf, aes(x = Pos, y = Fee)) + geom_smooth()
+```
+
+We see a negative trend. This indicates that on average a team at the bottom end of the table would define a successful transfer (in terms of cost) differently to that of the upper end - 
+
+```{r,echo=FALSE}
+first = fulldf %>%
+  filter(Pos == 1)
+bar = mean(first$Fee)
+
+n = length(first$Fee)
+xbar = mean(first$Fee)
+s = sd(first$Fee)
+
+margin= qt(0.975, n-1)*s/sqrt(n)
+
+low = xbar - margin
+up = xbar + margin
+
+firstconfint = c(low,xbar,up)
+
+last = fulldf %>%
+  filter(Pos == 20)
+bar = mean(last$Fee)
+
+n = length(last$Fee)
+xbar = mean(last$Fee)
+s = sd(last$Fee)
+
+margin = qt(0.975, n-1)*s/sqrt(n)
+low = xbar - margin
+up = xbar + margin
+
+lastconfint = c(low,xbar,up)
+
+firstconfint
+lastconfint
+```
+
+At the 95% level I observed that even in the least extreme case, teams at the top of the league spend an average of 5 million more per transfer than teams at the bottom.
+
+The resulting conclusion from this analysis is that any inclusion of the variable 'Fee' fit to the model should carefully consider the relationship between the fee of the player and the position of the club. The 'value' of a player to a team at the bottom of the league is different than the value of a player of the same fee to a team at the top.
+
+### Issue with PPG.Diff
+
+We now see a drawback of the PPG.Diff variable. When viewing the relationship between PPG.Diff and Fee:
+
+```{r,echo=FALSE,warning=FALSE}
+ggplot(notpromoted[notpromoted$Fee > 1,], aes(x = PPG.Diff, y = log(Fee))) + geom_point() + geom_smooth()
+```
+
+I observed that there was no real relationship between the two. This seems unexpected: you would expect on average a more expensive player to improve a team more. However, there are numerous reasons that could explain what we see on the graph. One of these is that a points improvement has different 'value' for different teams: in the most extreme instance a team who wins every game in a Premier League season cannot then have a PPG.Diff greater than 0 in the following season; though a two point drop off would almost surely still be deemed a successful season, any transfer who arrives would be deemed a failure by this metric. Although this was a setback with regards to using PPG.Diff as the method of evaluating success, it also presented new ideas for constructing a model - a model with the interaction between a clubs PPG.Diff and how many points they achieved may yield useful results.
+
+# Fitting a Model
+
+## Defining Success
+
+Since I moved away from the idea of using PPG.Diff as a means of checking for transfer success, another idea I explored was using the model to assess the probability that the transfer would be deemed a success by others. In order to do this I checked numerous articles published by established media such as https://www.fourfourtwo.com/, https://onefootball.com/, https://talksport.com/ and more, and took note of the transfers they deemed to be successful/unsuccessful or to have had a successful/unsuccessful debut season. These lists could be extended by doing more research, but at this time, it is the following:
+
+```{r,echo=FALSE}
+successes = c(c("Diego Costa",2014),c("Fernando Torres",2007),c("Sergio Aguero",2011),c("Michu",2012),
+              c("N Golo Kante",2015),c("Erling Haaland",2022),c("Mo Salah",2017),c("Ayoze Pérez",2014),
+              c("Harry Maguire",2017),c("Romelu Lukaku",2014),c("Wilfried Zaha",2014),c("Philippe Coutinho",2012),
+              c("Dele Alli",2015),c("Kevin De Bruyne",2015),c("Sadio Mane",2014),c("Cesar Azpilicueta",2012),
+              c("David de Gea",2011),c("Yaya Toure",2010),c("Eden Hazard",2012),c("Luis Suarez",2010),
+              c("Robin Van Persie",2012),c("Andy Robertson",2017),c("Virgil van Dijk",2017),c("David Silva",2010),
+              c("Vincent Kompany",2008),c("Pablo Zabaleta",2008),c("Fernandinho",2013),c("Raheem Sterling",2016),
+              c("Luka Modric",2008),c("Mesut Ozil",2013),c("Nemanja Matic",2013),c("Bruno Fernandez",2019),
+              c("Cesc Febregas",2014),c("Oscar",2012),c("Hugo Lloris",2012),c("Alisson",2018),
+              c("Ederson",2017),c("Rodri",2019),c("Ruben Dias",2020),c("Zlatan Ibrahimovic",2016))
+
+failures = c(c("Danny Drinkwater",2017),c("Dani Osvaldo",2013),c("Mario Balotelli",2014),c("Alexis Sanchez",2018),
+             c("Bebe",2010),c("David Bentley",2008),c("Roger Johnson",2011),c("Alberto Aquilani",2009),
+             c("Gaston Ramirez",2012),c("Jack Rodwell",2014),c("Saido Berahino",2017),c("Giannelli Imbula",2016),
+             c("Nikola Zigic",2010),c("Papy Djilobodji",2016),c("Didier Ndong",2016),c("Andy Carroll",2011),
+             c("Alvaro Morata",2017),c("Sebastien Haller",2019),c("Tanguy Ndombele",2019),c("Eliaquim Mangala",2014),
+             c("Tiemoue Bakayoko",2017),c("Nicolas Pepe",2019),c("Lazar Markovic",2014),c("Shkodran Mustafi",2016),
+             c("Angel Di Maria",2014),c("Paul Pogba",2016),c("Romelu Lukaku",2021),c("Harry Maguire",2019))
+successes
+failures
+```
+
+I then created a new variable 'Success' and assigned a 1 to those players who were deemed successful and 0 to the ones deemed unsuccessful along with -1 to players who had not been assigned. This would allow me to create a binary logistic regression model.
+
+```{r,echo=FALSE}
+fulldf$Reds = as.numeric(fulldf$Reds)
+fulldf$Yellows = as.numeric(fulldf$Yellows)
+fulldf = fulldf %>%
+  mutate(Booking_Pts = Yellows + 2*Reds)
+training = fulldf %>%
+  mutate(Success = -1)
+for(i in 1:length(successes)/2){
+  training$Success[training$Player == successes[2*i-1] & training$Season == successes[2*i]] = 1
+}
+for(i in 1:length(failures)/2){
+  training$Success[training$Player == failures[2*i-1] & training$Season == failures[2*i]] = 0
+}
+training[,9:17] = sapply(training[,9:17],as.numeric)
+```
+
+After that I filtered out the players who had not been assigned, leaving me with a suitable validation set of data.
+
+```{r,echo=FALSE}
+trainingdf = training %>%
+  filter(Success != -1)
+test = setdiff(training,trainingdf)
+```
+
+## An Initial Model
+
+### Mathematical Background
+
+
+
+### The Model
+
+And now we can fit an initial model, I opted to fit a model for success in terms of the number of Premier League halves (found by taking the 'Minutes' variable divided by 45), the interaction between a teams previous season success and their PPG.Diff, the interaction between appearances and yellows/reds and the interaction between fee paid and league standing.
+
+```{r,echo=FALSE}
+mod0 = glm(data = trainingdf, formula = Success ~ I(Minutes/45) + LastSeasonPts:PPG.Diff + Apps:Yellows + Apps:Reds + Pos:Fee, family = binomial(logit))
+summary(mod0)
+```
+
+## Improving on the Model
+
+We immediately notice one largely insignificant variable. The interaction between appearances and red cards has a p-value of 0.5, showing that the relationship between this term and the Success variable is unclear. Despite this, the coefficient is as we'd expect. The Apps:Yellows and Apps:Reds terms both have a negative impact on the output variable with Apps:Reds effect significantly larger leading me to believe that the larger p-value is a result of a low amount of data instead of a non-relationship. To adjust for this I elected to remove the terms 'Apps:Yellows' and 'Apps:Reds' from the model and replace it with the term 'Apps:Booking_Pts' where Booking_Pts is a new variable using an established metric in football - taking the sum of number of yellows and double the number of reds. Fitting this model we see the following:
+
+```{r,echo=FALSE}
+mod0 = glm(data = trainingdf, formula = Success ~ I(Minutes/50) + Pts + Apps:Booking_Pts + Season:Fee , family = binomial(logit))
+summary(mod0)
+```
+
+This model seems much more useful, as the margin of error for 'Reds' has been removed. One metric which supports the idea that this model is a better fit is the lower AIC value, 35.334 against 49.67.
+
+Next we try to once again improve upon this model. If we consider the 'Minutes' variable we notice that players who arrive in the Winter transfer window can only possibly play (approximately) half of what a player signed in the Summer is available for. In addition, I wanted a way to express a players impact on a teams game to game success within the model. Originally, the idea for this was group positions into thirds of the pitch - for example left-backs and centre-backs would be 'Defenders' and right-midfielders and centre-midfielders would be midfielders - and then to use the interaction between a players interaction and individual statistics such as goals or assists. However the issue that arises from this is twofold; firstly, contribution specifically in the midfield is far more varied than I presumed, leading to all terms involving midfielders being deemed insignificant at the 95% value; also, I lacked the data required to adequately measure defensive success, I do not have data on defensive statistics such as tackles or blocks and as such do not have a useful term to input into the model. Thus such a term is not applicable to my dataset. To build upon my model in a future study, I would remedy this by extending the dataframe to include more position-specific statistics.
+
+```{r,echo=FALSE}
+training = fulldf %>%
+  mutate(Success = -1)
+  
+
+for(i in 1:length(successes)/2){
+  training$Success[training$Player == successes[2*i-1] & training$Season == successes[2*i]] = 1
+}
+for(i in 1:length(failures)/2){
+  training$Success[training$Player == failures[2*i-1] & training$Season == failures[2*i]] = 0
+}
+
+training[,9:17] = sapply(training[,9:17],as.numeric)
+
+training = training %>%
+  filter(Success != -1)
+
+```
+
+```{r,echo = FALSE}
+set.seed(442)
+
+trainingdf = training[sample(nrow(training),size = 45),]
+
+test = setdiff(training,trainingdf)
+
+mod1 = glm(data = trainingdf, Success ~ Window:Minutes + Pts + Season:Fee + Booking_Pts,family = binomial(logit))
+summary(mod1)
+```
+
+In the comparison of the two models we see that the first appears to have a better proportion of significant variables; the second model includes two coefficients which are deemed insignificant at the 95% level, the coefficient for the minutes given the player signed in Winter and the coefficient for booking points. In both of these instances, considering the context of the model is useful: first, it definitely appears reasonable that minutes for a player signed in the Winter have a larger 'effect' on the deemed success of the player than Summer, since minutes are more scarce; it also appears reasonable that a player with more bookings in the same number of minutes will be deemed to be less successful. Therefore it is useful to consider the reasons for why these terms may have been found insignificant. For the minutes for players signed in Winter the solution may lie in the data set: there are 5 players in the training dataset used for model fitting. This low sample size results in a larger p-value, so the p-value observed is likely a result of the choice of sample. For the booking points variable, it may be worth checking booking points in terms of the position of each player.
+
+```{r,echo = FALSE}
+trainingdf %>%
+  group_by(Position) %>%
+  summarise(Mean.Booking_Pts = mean(Booking_Pts), n = n())
+```
+From the table, we see that players number of booking points received by players varies dramatically based on the position they play with goalkeepers receiving an average of 5 booking points less than defensive midfielders in a season. This in combination with my previous idea to in a future improvement upon this model including position based statistics leads me to believe that a stronger basis for modelling would be to fit different models for different positions, as to consider terms that are significant for that players position.
+
+BIT ABOUT MINUTES FOR WINTER PLAYERS
+
+```{r,echo=FALSE}
+notpromoted = fulldf %>%
+  filter(LastSeasonPts != 0)
+winter = notpromoted %>%
+  filter(Window == as.factor("w")) %>%
+  mutate(Minutes_Value = 2*Minutes)
+summer = notpromoted %>%
+  filter(Window == as.factor("s")) %>%
+  mutate(Minutes_Value = Minutes)
+notpromoted = rbind(winter,summer)
+
+training = notpromoted %>%
+  mutate(Success = -1)
+  
+
+for(i in 1:length(successes)/2){
+  training$Success[training$Player == successes[2*i-1] & training$Season == successes[2*i]] = 1
+}
+for(i in 1:length(failures)/2){
+  training$Success[training$Player == failures[2*i-1] & training$Season == failures[2*i]] = 0
+}
+
+training[,9:17] = sapply(training[,9:17],as.numeric)
+
+training = training %>%
+  filter(Success != -1)
+
+set.seed(442)
+
+trainingdf = training[sample(nrow(training),size = 45),]
+
+test = setdiff(training,trainingdf)
+
+mod2 = glm(data = trainingdf, Success ~ Minutes_Value + Apps:Booking_Pts + LastSeasonPts:Pts + Season:Fee,family = binomial(logit))
+summary(mod2)
+```
+
+## Validation
+
+### Cross Reference
+
+The first form of validation I used was more visual, comparing values of prediction against true value and checking for noteable entries within the test set (that is, the set of data I did not use to fit the model.
+
+```{r, echo = FALSE}
+test = test %>%
+  mutate(Prediction = predict(mod1, test, type = "response")) %>%
+  dplyr::select(c(Player,Success,Prediction))
+test
+```
+
+From the dataframe, we see a good fit. The largest deviation from the true value is in Tiemoue Bakayoko, at 33.0%, with a lot of the other entries being extremely close to the correct value. This is a good indicator of a solid fit as this is an entirely new set of data that has been used to produce an output which, for these 6 entries at least, is a good approximation.
+
+### Accuracy
+
+Now we seek more model validation. We calculate the accuracy of the model by taking many different training sets with 1 entry left for the testing set, so that each entry will be used a the test set at some point, treating prediction values above 0.5 as 1 and those below 0.5 as zero, then calculating the error in accuracy for each entry, enterring it to a list, and finally taking the mean.
+
+```{r,echo=FALSE}
+acc <- NULL
+for(i in 1:nrow(training))
+{
+  # Train-test splitting
+  # 499 samples -> fitting
+  # 1 sample -> testing
+  train <- training[-i,]
+  test <- training[i,]
+  
+  # Fitting
+  
+  model <- mod1
+  # Predict results
+  results_prob <- predict(model,test,type='response')
+  
+  # If prob > 0.5 then 1, else 0
+  results <- ifelse(results_prob > 0.5,1,0)
+  
+  # Actual answers
+  answers <- test$Success
+  
+  # Calculate accuracy
+  wrong <- mean(answers != results)
+  
+  # Collecting results
+  acc[i] <- 1-wrong
+}
+
+# Average accuracy of the model
+mean(acc)
+```
+
+This value of ~90.2% indicates that when generalized to either a successful or unsuccessful transfer, our model successfully allocated a value for 90.2% of the train-test set. If we compare this to our first model, we see a decrease in accuracy:
+
+```{r,echo=FALSE}
+acc <- NULL
+for(i in 1:nrow(training))
+{
+  # Train-test splitting
+  # 499 samples -> fitting
+  # 1 sample -> testing
+  train <- training[-i,]
+  test <- training[i,]
+  
+  # Fitting
+  
+  model = mod0
+  # Predict results
+  results_prob <- predict(model,test,type='response')
+  
+  # If prob > 0.5 then 1, else 0
+  results <- ifelse(results_prob > 0.5,1,0)
+  
+  # Actual answers
+  answers <- test$Success
+  
+  # Calculate accuracy
+  wrong <- mean(answers != results)
+  
+  # Collecting results
+  acc[i] <- 1-wrong
+}
+
+# Average accuracy of the model
+mean(acc)
+```
+
+Indicating that our new model has an improved accuracy (~5.6%). This is another indication that our model is the better of the two for prediction.
+
+```{r,echo=FALSE}
+notpromoted$Success = predict(mod2, notpromoted, type = "response")
+```
+
+## Checking Model Assumptions
+
+In fitting logistic regression models, there are two main assumptions that must be satisfied. That is, linearity of predictor effects and independence of data points. It is important that both of these are satisfied as else our predictions may be bias and/or inaccurate. Unfortunately it may be impossible to entirely avoid dependence in this instance. Given two players that sign for the same team in the same window who play the same position, the number of minutes one plays will have correlation with the number of minutes the other plays and since this is a significant variable in terms of defining success, there will be correlation there also. This is potentially an unavoidable situation, and as such it is worth acknowledging it when referencing the model predictions. For the linearity assumption we need the relationship between success probability and predictors to be linear. We can by plotting the non-interactive terms against output:
+
+```{r,echo=FALSE}
+ggplot(training, aes(x = Minutes_Value, y = Success)) + geom_smooth()
+```
+
+This relationship at the very least can be approximated to linearity, the confidence bands at each end demonstrate that their may be a linear fit it more data was collected. Alternatively one could observe that the graphic (currently) plateaus for Minutes_Value > 3000 and Minutes_Value < 1000, and so could alter the data frame so that all players below 1000 Minutes_Value are represented as 1000 and all above as 3000. In this instance I elected to maintain the current model since it appeared reasonable contextually for the relationship to be linear.
+
+## Case Study - Leicester City FC
+
+Throughout the exploratory analyses and model fitting process I chose to investigate application to one team in particular, Leicester City. The reason for this choice lies in the differences between the 2015-16 season and the 2016-17 season for this club in particular. The team had managed to marginally remain the premier league in the 2014-15 season and proceeded to win the league the following year, an unprecedented feat which was deemed one of the biggest upsets in football history, in fact bookmakers were alleged to have ‘plucked odds out of thin air,’ 5. https://www.bbc.co.uk/news/uk-england-leicestershire-37037652#:~:text=So%20how%20has%20the%20side%20changed%20the%20landscape,the%20betting%20research%20unit%20at%20Nottingham%20Business%20School.,  when setting the 5000/1 odds on Leicester winning the league, a ratio that has not been seen in football since. However following this significant improvement in the club, the 2016-17 season saw them revert to their original status of a mid-bottom level club. The difference in these two seasons was so stark that the 2015-16 season saw them in the top five percentile of PPG.Diff and the 2016-17 season in the bottom five percentile. As such I predicted that I would expect to see a lot of the characteristics of successful and unsuccessful transfers satisfied in the two seasons.
+
+Using PPG.Diff I performed other exploratory analysis such as identifying the extreme values within the full dataframe. Since the PPG.Diff follows a normal distribution, I found the extreme values on the upper end:
+
+```{r,echo=FALSE}
+Leicester = notpromoted %>%
+  filter(Club == "Leicester") %>%
+  filter(Season == 2015)
+Leicester = Leicester[,append(1:17,36)]
+Leicester = Leicester[,-c(3,5)]
+Leicester
+```
+
+Observe that the players with large minute and/or appearance contributions had a high success rate while those who did not participate as much were deemed unsuccessful. Similarly if we check the 2016 season
+
+```{r,echo=FALSE}
+Leicesterbad = notpromoted %>%
+  filter(Club == "Leicester") %>%
+  filter(Season == 2016)
+Leicesterbad = Leicesterbad[,append(1:17,36)]
+Leicesterbad = Leicesterbad[,-c(3,5)]
+Leicesterbad
+```
+
+Then the we see that almost all players were deemed unsuccessful, players were introduced for more money while playing less minutes in a side falling down the league table. The exception is Wilfred Ndidi who is deemed successful by the model on the basis that he played most minutes available to him as a winter transfer without receiving any booking points. However it does appear as though minutes increase success probability by a very large amount. There could be a number of reasonable explanations for this, one such being that if a player is performing, they will continue to be played so long as they are fit. As such minutes are intrinsically linked to success rate.
